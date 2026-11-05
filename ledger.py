@@ -26,6 +26,12 @@ class Receipt:
     duration_ms: int
 
 
+def _task_of(turn_id: str) -> str | None:
+    """The task segment of a full turn id "session:task:uuid8", else None."""
+    parts = turn_id.split(":")
+    return parts[1] if len(parts) == 3 and parts[1] else None
+
+
 class Ledger:
     def __init__(self, lookback_turns: int = 3, max_sessions: int = 256,
                  max_receipts_per_turn: int = 500) -> None:
@@ -55,8 +61,21 @@ class Ledger:
                         sess.user_messages.pop(old, None)
                 if msg_str is not None:
                     sess.user_messages[turn_id] = msg_str
+            elif not turn_id:
+                # Real runtime: pre_llm_call fires before the turn id is minted.
+                # Open a slot (empty id) as the newest main turn so the later
+                # full-id receipts/user_message bind into it.
+                if (not sess.main_turn_order
+                        or sess.main_turn_order[-1] != ""):
+                    sess.main_turn_order.append("")
+                    while len(sess.main_turn_order) > self._lookback + 1:
+                        old = sess.main_turn_order.pop(0)
+                        sess.turns.pop(old, None)
+                        sess.user_messages.pop(old, None)
+                if msg_str is not None:
+                    sess.user_messages[""] = msg_str
             else:
-                # Fork or empty: just store user_message under the resolved key
+                # Fork: just store user_message under the resolved key
                 key = self._resolve_key(sess, turn_id)
                 if msg_str is not None:
                     sess.user_messages[key] = msg_str
@@ -102,13 +121,64 @@ class Ledger:
                 sess.user_messages.pop(old, None)
         return turn_id
 
+    def _slot_for_full_id(self, sess: _Session, turn_id: str) -> tuple[str, str]:
+        """Return (storage_key, order_key) for a full "session:task:uuid8" id.
+
+        In the real runtime, begin_turn fires at pre_llm_call with an EMPTY
+        turn_id (the id is minted after that hook), while post_tool_call and
+        transform carry the full id. The empty begin_turn registered a slot as
+        the newest main turn; bind this full id to that slot when its task
+        matches, so receipts, lookback, and user_message all resolve correctly.
+        """
+        task = _task_of(turn_id)
+        if sess.main_turn_order:
+            newest = sess.main_turn_order[-1]
+            newest_task = _task_of(newest)
+            if newest == "" or newest_task is None or newest_task == task:
+                # The slot is open (empty) or belongs to the same task: adopt the full id.
+                idx = sess.main_turn_order.index(newest)
+                sess.main_turn_order[idx] = turn_id
+                if newest != turn_id:
+                    if newest in sess.turns:
+                        sess.turns[turn_id] = sess.turns.pop(newest)
+                    if newest in sess.user_messages:
+                        sess.user_messages[turn_id] = sess.user_messages.pop(newest)
+                return turn_id, turn_id
+        # No matching slot: register the full id as a new main turn.
+        key = self._resolve_key(sess, turn_id)
+        return key, key
+
+    def _main_key(self, sess: _Session, turn_id: str) -> str:
+        """Read-only resolution of a turn_id to a main-turn storage key.
+
+        Mirrors record()'s binding: full "session:task:uuid8" ids bind to the
+        newest open/same-task slot; unknown full ids resolve to the newest slot
+        when their task matches, else read empty. Never mutates.
+        """
+        if not turn_id:
+            return sess.main_turn_order[-1] if sess.main_turn_order else "__noturn__"
+        if ":" not in turn_id:
+            return turn_id
+        task = _task_of(turn_id)
+        if turn_id in sess.main_turn_order:
+            return turn_id
+        if sess.main_turn_order:
+            newest = sess.main_turn_order[-1]
+            newest_task = _task_of(newest)
+            if newest == "" or newest_task is None or newest_task == task:
+                return newest
+        return turn_id  # belongs to no known slot; reads empty
+
     def record(self, *, tool_name: str, args: Any = None, result: Any = None,
                session_id: str = "", turn_id: str = "", status: str | None = None,
                error_type: str | None = None, error_message: str | None = None,
                duration_ms: int = 0, **_ignored) -> Receipt:
         with self._lock:
             sess = self._get_session(session_id)
-            key = self._resolve_key(sess, turn_id)
+            if ":" in turn_id and _task_of(turn_id) is not None and turn_id not in sess.fork_order:
+                key, _ = self._slot_for_full_id(sess, turn_id)
+            else:
+                key = self._resolve_key(sess, turn_id)
 
             # Parse result into a dict if possible
             result_dict = None
@@ -232,7 +302,17 @@ class Ledger:
             else:
                 key = turn_id
 
-            if ":" in key or key == "__noturn__":
+            is_full_id = ":" in key and _task_of(key) is not None
+            if is_full_id:
+                key = self._main_key(sess, key)
+                if key not in sess.main_turn_order:
+                    order = sess.main_turn_order
+                    # Unknown full id: check its own receipts, then recent turns
+                    return [(0, list(sess.turns.get(key, [])))] + [
+                        (-off, list(sess.turns.get(order[-off], [])))
+                        for off in range(1, min(self._lookback, len(order)) + 1)
+                    ]
+            elif key == "__noturn__" or (":" in key and not is_full_id):
                 # Fork or noturn: just return its receipts
                 receipts = sess.turns.get(key, [])
                 return [(0, list(receipts))]
@@ -268,6 +348,8 @@ class Ledger:
                     key = sess.main_turn_order[-1]
                 else:
                     key = "__noturn__"
+            elif ":" in turn_id and _task_of(turn_id) is not None:
+                key = self._main_key(sess, turn_id)
             else:
                 key = turn_id
             return sess.user_messages.get(key)
